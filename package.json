@@ -1,0 +1,53 @@
+{
+  "name": "@sinkerine/pi-btw",
+  "version": "0.1.0",
+  "description": "Read-only side conversations with exact finished Pi context",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "extensions",
+    "src",
+    "README.md",
+    "docs",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "exports": {
+    "./contract": "./src/contract.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/btw.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=1.4.0 <2",
+    "@earendil-works/pi-agent-core": ">=1.4.0 <2",
+    "@earendil-works/pi-coding-agent": ">=1.4.0 <2",
+    "@earendil-works/pi-tui": ">=1.4.0 <2"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-agent-core": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
+    "@biomejs/biome": "2.6.6",
+    "@types/node": "^22.19.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format:files": "biome check --write",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration --maxWorkers=1",
+    "measure:cache": "node scripts/measure-cache.mjs"
+  }
+}
