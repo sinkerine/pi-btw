@@ -173,21 +173,37 @@ export class BtwCommands {
   private async ensureThread(
     ctx: ExtensionContext,
     mode: BtwMode,
+    allowEmpty = false,
   ): Promise<BtwThread> {
     if (this.restoreError) throw this.restoreError;
     if (this.thread) return this.thread;
     if (!ctx.model) throw new BtwError("model_unavailable");
-    let snapshot: BtwSnapshot;
-    if (mode === "contextual") snapshot = this.tracker.current(ctx);
-    else {
-      const messages: AgentMessage[] = [
-        {
-          role: "system",
-          content:
-            "You answer side questions independently of the main conversation.",
-          timestamp: Date.now(),
-        },
-      ];
+    let snapshot: BtwSnapshot | undefined;
+    if (mode === "contextual") {
+      try {
+        snapshot = this.tracker.current(ctx);
+      } catch (error) {
+        if (
+          !allowEmpty ||
+          !(error instanceof BtwError) ||
+          error.code !== "no_finished_turn"
+        )
+          throw error;
+      }
+    }
+    if (mode === "tangent" || !snapshot) {
+      // An unpinned contextual composer has no inherited request and is not a resumable snapshot.
+      const messages: AgentMessage[] =
+        mode === "tangent"
+          ? [
+              {
+                role: "system",
+                content:
+                  "You answer side questions independently of the main conversation.",
+                timestamp: Date.now(),
+              },
+            ]
+          : [];
       snapshot = {
         messages,
         model: ctx.model,
@@ -208,10 +224,13 @@ export class BtwCommands {
       randomUUID(),
       ctx.sessionManager.getSessionFile(),
     );
-    await store.saveSnapshot(snapshot);
-    store.appendBoundary(snapshot.boundary, "boundary");
+    const pinned = mode === "tangent" || snapshot.boundary.kind === "turn_end";
+    if (pinned) {
+      await store.saveSnapshot(snapshot);
+      store.appendBoundary(snapshot.boundary, "boundary");
+    }
     this.makeThread(ctx, mode, snapshot, store);
-    this.index(snapshot);
+    if (pinned) this.index(snapshot);
     this.emit(this.threadState());
     if (!this.thread) throw new BtwError("no_thread");
     return this.thread;
@@ -369,9 +388,8 @@ export class BtwCommands {
     }
     const mode = name === "btw:tangent" ? "tangent" : "contextual";
     this.composerMode = mode;
-    // Empty contextual commands can open a composer before any parent turn has finished.
     if (!args.trim()) {
-      if (mode === "tangent") await this.ensureThread(ctx, mode);
+      await this.ensureThread(ctx, mode, true);
       this.open(ctx);
       return;
     }

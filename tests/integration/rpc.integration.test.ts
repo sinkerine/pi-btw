@@ -81,6 +81,176 @@ test("busy parent continues; queued question pins when dequeued; Stop is admitte
     await stub.close();
   }
 });
+test("empty New replaces the old RPC thread with an idle composer and empty timeline; only the next explicit question calls the provider", async () => {
+  const stub = await httpStub("openai-completions", () => ({}));
+  const pi = await PiFixture.create(stub.baseUrl, "openai-completions");
+  try {
+    await pi.start();
+    await pi.parent("parent for empty New");
+    await pi.prompt("/btw old thread question");
+    const old = await pi.state();
+    const calls = stub.captures.length;
+    const offset = pi.events.length;
+    await pi.prompt("/btw:new");
+    const replacement = await until(
+      () => pi.events.slice(offset).find((event) => event.type === "state"),
+      "replacement idle descriptor after empty New",
+    );
+    if (replacement.type !== "state") throw new Error("missing state");
+    const fresh = replacement.thread;
+    expect(pi.events.slice(offset)).toEqual([
+      {
+        type: "closed",
+        version: 1,
+        parentSessionId: old.parentSessionId,
+        threadId: old.threadId,
+        reason: "replaced",
+      },
+      replacement,
+    ]);
+    expect(fresh).toMatchObject({
+      status: "idle",
+      mode: "contextual",
+      title: "BTW",
+      error: null,
+      resumable: true,
+      boundary: old.boundary,
+      cache: { sharesParentPrefix: true },
+    });
+    expect(fresh.threadId).not.toBe(old.threadId);
+    expect(fresh.sessionFile).not.toBe(old.sessionFile);
+    if (!fresh.sessionFile) throw new Error("replacement timeline missing");
+    const emptyTimeline = (await readFile(fresh.sessionFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(emptyTimeline.filter((entry) => entry.type === "message")).toEqual(
+      [],
+    );
+    expect(stub.captures).toHaveLength(calls);
+    const afterOpen = pi.events.length;
+    await pi.prompt("/btw explicit new thread question");
+    const answered = await pi.state("idle", afterOpen);
+    expect(answered.threadId).toBe(fresh.threadId);
+    expect(stub.captures).toHaveLength(calls + 1);
+    expect(JSON.stringify(stub.captures.at(-1)?.body)).toContain(
+      "parent for empty New",
+    );
+    expect(JSON.stringify(stub.captures.at(-1)?.body)).toContain(
+      "explicit new thread question",
+    );
+    expect(JSON.stringify(stub.captures.at(-1)?.body)).not.toContain(
+      "old thread question",
+    );
+    await pi.prompt("/btw:clear");
+    expect(pi.events.at(-1)).toMatchObject({
+      type: "closed",
+      reason: "cleared",
+      threadId: fresh.threadId,
+    });
+    expect(stub.captures).toHaveLength(calls + 1);
+    if (process.env.BTW_REPORT_DIR)
+      await writeFile(
+        join(process.env.BTW_REPORT_DIR, "empty-new-rpc.json"),
+        JSON.stringify(
+          { old, fresh, answered, callsDuringOpen: 0, clear: pi.events.at(-1) },
+          null,
+          2,
+        ),
+      );
+  } finally {
+    await pi.close();
+    await stub.close();
+  }
+});
+
+test("unpinned empty RPC composer claims no snapshot or resume until a real finished parent turn is pinned", async () => {
+  const stub = await httpStub("openai-completions", (_capture, index) => ({
+    hold: index === 0,
+  }));
+  const pi = await PiFixture.create(stub.baseUrl, "openai-completions");
+  try {
+    await pi.start();
+    await pi.prompt("/btw:new");
+    const event = await until(
+      () => pi.events.find((event) => event.type === "state"),
+      "unpinned idle composer",
+    );
+    if (event.type !== "state") throw new Error("missing state");
+    const draft = event.thread;
+    expect(draft).toMatchObject({
+      status: "idle",
+      mode: "contextual",
+      resumable: false,
+      boundary: {
+        kind: "none",
+        parentTurnIndex: null,
+        parentLeafEntryId: null,
+        messageCount: 0,
+      },
+      cache: { sharesParentPrefix: false, reason: "unverified_serialization" },
+    });
+    if (!draft.sessionFile) throw new Error("draft timeline missing");
+    expect((await readdir(join(draft.sessionFile, ".."))).sort()).toEqual([
+      "state.json",
+      "thread.jsonl",
+    ]);
+    expect(stub.captures).toHaveLength(0);
+    const beforeParent = pi.records.length;
+    await pi.prompt("first coherent parent");
+    await until(() => stub.captures[0], "first parent request still in flight");
+    await pi.prompt("/side cannot ask without context");
+    const failed = await pi.state("failed");
+    expect(failed.threadId).toBe(draft.threadId);
+    expect(failed.error).toContain("no_finished_turn");
+    expect(stub.captures).toHaveLength(1);
+    expect(await readFile(draft.sessionFile, "utf8")).not.toContain(
+      '"type":"message"',
+    );
+    stub.release(0);
+    await until(
+      () =>
+        pi.records
+          .slice(beforeParent)
+          .find((record) => record.type === "agent_settled"),
+      "first coherent parent finishes",
+    );
+    const parentFile = (await pi.rpc("get_state")).data?.sessionFile;
+    if (typeof parentFile !== "string") throw new Error("parent file missing");
+    expect(await readFile(parentFile, "utf8")).not.toContain(
+      '"customType":"pi-btw/thread"',
+    );
+    const offset = pi.events.length;
+    await pi.prompt("/btw now use real context");
+    const pinned = await pi.state("idle", offset);
+    expect(pinned).toMatchObject({
+      threadId: draft.threadId,
+      resumable: true,
+      boundary: { kind: "turn_end", parentTurnIndex: 1 },
+      cache: { sharesParentPrefix: true, reason: null },
+    });
+    expect(stub.captures).toHaveLength(2);
+    expect(JSON.stringify(stub.captures[1]?.body)).toContain(
+      "first coherent parent",
+    );
+    expect(JSON.stringify(stub.captures[1]?.body)).not.toContain(
+      "cannot ask without context",
+    );
+    const files = await readdir(join(draft.sessionFile, ".."));
+    expect(files).toContain(`${pinned.boundary.prefixDigest}.json`);
+    expect(files).not.toContain(`${draft.boundary.prefixDigest}.json`);
+    await pi.stop();
+    await pi.start(parentFile);
+    const resumed = await pi.state();
+    expect(resumed.threadId).toBe(draft.threadId);
+    expect(resumed.boundary).toEqual(pinned.boundary);
+    expect(stub.captures).toHaveLength(2);
+  } finally {
+    await pi.close();
+    await stub.close();
+  }
+});
+
 test("inject while busy and summarize each send one follow-up; close and clear send nothing", async () => {
   const stub = await httpStub("openai-completions", (capture, index) => ({
     hold: index === 2,
@@ -339,6 +509,27 @@ test("real TUI opens BTW while main streams and records latest-finished pinning 
       () => (output.includes("TUI_FIXTURE_READY") ? true : undefined),
       `TUI ready; ${stderr}`,
     );
+    // A trailing space closes Pi's asynchronously populated slash autocomplete before Enter.
+    input("/btw \r");
+    await waitEvent(
+      (event) =>
+        event.type === "state" &&
+        typeof event.thread === "object" &&
+        event.thread !== null &&
+        "status" in event.thread &&
+        event.thread.status === "idle",
+      "TUI empty composer opens before a finished parent turn",
+    );
+    await until(
+      () => (output.includes("pinned turn none") ? true : undefined),
+      "TUI unpinned empty composer renders",
+    );
+    expect(stub.captures).toHaveLength(0);
+    input("\u001b");
+    await waitEvent(
+      (event) => event.type === "overlay_closed",
+      "empty TUI composer dismisses to main",
+    );
     input("parent A\r");
     await waitEvent(
       (event) => event.type === "parent_end",
@@ -378,10 +569,12 @@ test("real TUI opens BTW while main streams and records latest-finished pinning 
         Number(event.thread.revision) > 0,
       "TUI side completes",
     );
+    const beforeSideDismiss = (await events()).length;
     input("\u001b");
     await waitEvent(
       (event) => event.type === "overlay_closed",
       "TUI overlay dismisses and restores main focus",
+      beforeSideDismiss,
     );
     input("/btw next finished parent turn\r");
     await until(() => stub.captures[3], "TUI follow-up request");

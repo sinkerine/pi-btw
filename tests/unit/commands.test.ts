@@ -98,6 +98,112 @@ test("empty mode/alias commands make no request; contextual aliases, new, tangen
   }
 });
 
+test.each(["/btw", "/side", "/btw:new", "/btw:tangent"])(
+  "%s empty opens honest idle state before a finished turn; an explicit question still requires context",
+  async (command) => {
+    const host = await setup();
+    try {
+      await host.session.prompt(command);
+      const draft = states(host.events).at(-1);
+      expect(draft).toMatchObject({
+        mode: command === "/btw:tangent" ? "tangent" : "contextual",
+        status: "idle",
+        title: "BTW",
+        boundary: {
+          kind: "none",
+          parentLeafEntryId: null,
+          parentTurnIndex: null,
+          messageCount: command === "/btw:tangent" ? 1 : 0,
+        },
+        resumable: false,
+        cache: {
+          sharesParentPrefix: false,
+          reason:
+            command === "/btw:tangent" ? "tangent" : "unverified_serialization",
+        },
+      });
+      expect(host.provider.requests).toHaveLength(0);
+      expect(host.notices).toEqual([]);
+      const branch = host.sessionManager.getBranch();
+      host.pi.events.emit("pi-btw:sync", {});
+      expect(states(host.events).at(-1)).toEqual(draft);
+      expect(host.sessionManager.getBranch()).toEqual(branch);
+      expect(host.provider.requests).toHaveLength(0);
+      if (command !== "/btw:tangent") {
+        expect(
+          branch.some(
+            (entry) =>
+              entry.type === "custom" && entry.customType === "pi-btw/thread",
+          ),
+        ).toBe(false);
+        await host.session.prompt("/side question before a finished turn");
+        await until(
+          () => states(host.events).find((state) => state.status === "failed"),
+          "unpinned explicit question fails",
+        );
+        expect(states(host.events).at(-1)?.error).toContain("no_finished_turn");
+        expect(host.provider.requests).toHaveLength(0);
+        await host.session.prompt("parent A");
+      }
+      const offset = host.events.length;
+      await host.session.prompt("/btw explicit question");
+      const answer = await finished(host.events, offset);
+      expect(answer.threadId).toBe(draft?.threadId);
+      expect(answer.cache).toMatchObject({
+        sharesParentPrefix: command !== "/btw:tangent",
+        reason: command === "/btw:tangent" ? "tangent" : null,
+        requestSessionId:
+          command === "/btw:tangent" ? draft?.threadId : draft?.parentSessionId,
+      });
+      expect(answer.boundary.kind).toBe(
+        command === "/btw:tangent" ? "none" : "turn_end",
+      );
+      expect(host.provider.requests).toHaveLength(
+        command === "/btw:tangent" ? 1 : 2,
+      );
+      await host.session.prompt("/btw:clear");
+      expect(host.events.at(-1)).toMatchObject({
+        type: "closed",
+        reason: "cleared",
+        threadId: draft?.threadId,
+      });
+      expect(host.errors).toEqual([]);
+    } finally {
+      await host.close();
+    }
+  },
+);
+
+test.each(["/btw", "/side", "/btw:new", "/btw:tangent"])(
+  "%s empty opens after a finished turn and aliases reopen the same thread without a request",
+  async (command) => {
+    const host = await setup();
+    try {
+      await host.session.prompt("parent A");
+      await host.session.prompt(command);
+      const opened = states(host.events).at(-1);
+      expect(opened).toMatchObject({
+        status: "idle",
+        mode: command === "/btw:tangent" ? "tangent" : "contextual",
+        boundary: {
+          kind: command === "/btw:tangent" ? "none" : "turn_end",
+        },
+        cache: { sharesParentPrefix: command !== "/btw:tangent" },
+      });
+      expect(host.provider.requests).toHaveLength(1);
+      await host.session.prompt("/side");
+      await host.session.prompt("/btw");
+      host.pi.events.emit("pi-btw:sync", {});
+      expect(states(host.events).at(-1)).toEqual(opened);
+      expect(host.provider.requests).toHaveLength(1);
+      expect(host.notices).toEqual([]);
+      expect(host.errors).toEqual([]);
+    } finally {
+      await host.close();
+    }
+  },
+);
+
 test("model/thinking/status report override semantics and RPC questions acknowledge before a held answer; repeated sync is side-effect free", async () => {
   const host = await setup();
   try {

@@ -91,6 +91,8 @@ export class BtwThread {
     this.requestIdentity =
       options.mode === "tangent" ? this.id : this.snapshot.parentSessionId;
     const model = this.snapshot.model;
+    const pinned =
+      options.mode === "tangent" || this.snapshot.boundary.kind === "turn_end";
     this.current = {
       version: 1,
       parentSessionId: this.snapshot.parentSessionId,
@@ -99,7 +101,7 @@ export class BtwThread {
       status: options.interrupted ? "aborted" : "idle",
       title: options.title ?? "BTW",
       sessionFile: options.store.file,
-      resumable: options.store.file !== null,
+      resumable: pinned && options.store.file !== null,
       revision: 0,
       boundary: this.snapshot.boundary,
       parentAhead: 0,
@@ -109,8 +111,13 @@ export class BtwThread {
         api: model.api,
         thinkingLevel: this.snapshot.request.thinkingLevel,
         requestSessionId: this.requestIdentity,
-        sharesParentPrefix: options.mode === "contextual",
-        reason: options.mode === "tangent" ? "tangent" : null,
+        sharesParentPrefix: options.mode === "contextual" && pinned,
+        reason:
+          options.mode === "tangent"
+            ? "tangent"
+            : pinned
+              ? null
+              : "unverified_serialization",
       },
       lastUsage: null,
       error: options.interrupted
@@ -236,9 +243,17 @@ export class BtwThread {
       const changed =
         this.snapshot.boundary.prefixDigest !== latest.boundary.prefixDigest;
       await this.options.store.saveSnapshot(latest);
-      if (changed) this.options.store.appendBoundary(latest.boundary, "rebase");
+      if (changed)
+        this.options.store.appendBoundary(
+          latest.boundary,
+          this.snapshot.boundary.kind === "none" &&
+            this.options.mode === "contextual"
+            ? "boundary"
+            : "rebase",
+        );
       this.snapshot = latest;
       this.current.boundary = latest.boundary;
+      this.current.resumable = this.options.store.file !== null;
       this.current.cache = {
         provider: model.provider,
         modelId: model.id,

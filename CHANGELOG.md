@@ -7,4 +7,5 @@
 - Keep structured side history across rebases and persistent Pi restarts; refuse missing/corrupt context.
 - Add explicit Inject/Summarize, cancellation, tangent/new thread modes and model/thinking overrides.
 - Export the versioned host event contract and repeatable synchronization.
+- Emit idle composer state for empty commands in RPC and TUI, including replacement by New; unpinned contextual drafts claim no parent prefix or restart recovery.
 - Verify final OpenAI/Anthropic request serialization with real Pi 1.4.0; provide isolated live-cache measurement against the pinned dbachelder 0.8.1 baseline.
