@@ -5,7 +5,9 @@
 - Add read-only BTW and Side commands with a TUI overlay and independent concurrent model requests.
 - Capture exact completed parent requests, preserve tool declarations and automatically pin every question to the latest finished turn.
 - Keep structured side history across rebases and persistent Pi restarts; refuse missing/corrupt context.
-- Add explicit Inject/Summarize, cancellation, tangent/new thread modes and model/thinking overrides.
+- Add explicit Inject/Summarize, cancellation, tangent/new thread modes and model/thinking overrides; refuse empty delivery and never forward canceled, failed or empty summaries.
+- Restore captured context on parent tree changes; close threads rewound before a rebase and allow a fresh thread on the restored boundary.
+- Refuse unsupported BTW transports at command dispatch without disrupting normal parent capture.
 - Export the versioned host event contract and repeatable synchronization.
 - Emit idle composer state for empty commands in RPC and TUI, including replacement by New; unpinned contextual drafts claim no parent prefix or restart recovery.
 - Verify final OpenAI/Anthropic request serialization with real Pi 1.4.0; provide isolated live-cache measurement against the pinned dbachelder 0.8.1 baseline.

@@ -28,7 +28,7 @@ For a persistent package entry, add the checkout through your normal Pi package 
 | `/btw:thinking off\|minimal\|low\|medium\|high\|xhigh\|max` | Override BTW thinking.                                                                                         |
 | `/btw:status`                                               | Show structured status, pin, cache identity, last usage, resumability and error.                               |
 
-Empty `/btw`, `/side`, `/btw:new` and `/btw:tangent` open the TUI composer without calling a provider. JSON, print and RPC modes never open an overlay. Pass an inline question in those modes. In the overlay, Esc stops a running BTW request; press Esc again after it stops to dismiss. The overlay streams BTW's answer while the main agent continues. Dismiss it to use the main editor again.
+Empty `/btw`, `/side`, `/btw:new` and `/btw:tangent` initialize or reopen an idle thread without calling a provider. TUI opens the composer; RPC emits idle `pi-btw:thread` state without an overlay. Pass an inline question for headless JSON/print runs. In the overlay, Esc stops a running BTW request; press Esc again after it stops to dismiss. The overlay streams BTW's answer while the main agent continues. Dismiss it to use the main editor again.
 
 A question sent while BTW is answering queues in order. Each contextual question selects the latest **fully completed model turn and all its tool results** when it reaches dispatch. Parent progress never changes an answer already in flight. A changed parent boundary replaces the inherited context and keeps the full structured BTW history. There is no manual refresh. Before the first completed parent turn on a branch, use Tangent or finish a parent turn.
 

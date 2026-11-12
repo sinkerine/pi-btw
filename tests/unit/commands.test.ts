@@ -323,3 +323,171 @@ test("tree switch releases a thread outside active ancestry and refuses context 
     await host.close();
   }
 });
+
+test.each(["/btw:inject", "/btw:summarize"])(
+  "%s refuses an empty thread without a main or side provider request",
+  async (command) => {
+    const host = await setup();
+    try {
+      await host.session.prompt("parent A");
+      await host.session.prompt("/btw:new");
+      await host.session.prompt(command);
+      expect(host.notices.at(-1)).toContain("BTW is empty");
+      expect(host.provider.requests).toHaveLength(1);
+      expect(host.session.isStreaming).toBe(false);
+      expect(host.errors).toEqual([]);
+    } finally {
+      await host.close();
+    }
+  },
+);
+
+test.each([false, true])(
+  "abort summary queued=%s retains canceled status and never delivers a previous/partial answer to main",
+  async (queued) => {
+    const host = await setup();
+    try {
+      await host.session.prompt("parent A");
+      await host.session.prompt("/btw old answer");
+      await finished(host.events, 0);
+      host.provider.hold = true;
+      if (queued) {
+        await host.session.prompt("/btw ahead of summary");
+        await until(() => host.provider.requests[2], "ahead of summary");
+      }
+      await host.session.prompt("/btw:summarize canceled");
+      if (!queued)
+        await until(() => host.provider.requests[2], "running summary");
+      const offset = host.events.length;
+      await host.session.prompt("/btw:abort");
+      await until(
+        () => host.notices.find((notice) => notice.includes("canceled")),
+        "canceled summary notice",
+      );
+      expect(states(host.events.slice(offset)).at(-1)?.status).toBe("aborted");
+      expect(host.provider.requests).toHaveLength(3);
+      expect(host.session.isStreaming).toBe(false);
+      host.provider.hold = false;
+      const recovery = host.events.length;
+      await host.session.prompt("/btw next explicit question");
+      await finished(host.events, recovery);
+      expect(host.provider.requests).toHaveLength(4);
+      expect(host.errors).toEqual([]);
+    } finally {
+      await host.close();
+    }
+  },
+);
+
+test.each(["websocket", "websocket-cached"] as const)(
+  "%s capture preserves normal parent turns and refuses BTW with unsupported_serialization",
+  async (transport) => {
+    const host = await setup();
+    try {
+      host.session.settingsManager.setTransport(transport);
+      await host.session.prompt("parent under unsupported BTW transport");
+      await host.session.prompt("/btw refuse unsupported transport");
+      expect(host.notices.at(-1)).toContain("unsupported_serialization");
+      expect(host.notices.at(-1)).not.toContain("no_finished_turn");
+      expect(host.provider.requests).toHaveLength(1);
+      await host.session.prompt("normal parent continues");
+      expect(host.provider.requests).toHaveLength(2);
+      expect(host.errors).toEqual([]);
+    } finally {
+      await host.close();
+    }
+  },
+);
+
+test("same active branch tree event preserves a transient unpinned composer", async () => {
+  const host = await setup();
+  try {
+    await host.session.prompt("/btw:new");
+    const draft = states(host.events).at(-1);
+    const leaf = host.sessionManager.getLeafId();
+    await host.runner.emit({
+      type: "session_tree",
+      oldLeafId: leaf,
+      newLeafId: leaf,
+    });
+    host.pi.events.emit("pi-btw:sync", {});
+    expect(states(host.events).at(-1)).toEqual(draft);
+    expect(host.provider.requests).toHaveLength(0);
+  } finally {
+    await host.close();
+  }
+});
+
+test.each(["empty", "provider error"])(
+  "%s summary remains failed and sends nothing to main",
+  async (scenario) => {
+    const host = await setup();
+    try {
+      await host.session.prompt("parent A");
+      await host.session.prompt("/btw existing conversation");
+      await finished(host.events, 0);
+      host.provider.response = () =>
+        assistant("", scenario === "provider error" ? "error" : "stop");
+      const offset = host.events.length;
+      await host.session.prompt("/btw:summarize must not deliver");
+      await until(
+        () =>
+          states(host.events.slice(offset)).find(
+            (state) => state.status === "failed",
+          ),
+        "failed summary state",
+      );
+      expect(host.provider.requests).toHaveLength(3);
+      expect(host.session.isStreaming).toBe(false);
+      expect(states(host.events).at(-1)?.status).toBe("failed");
+      expect(host.errors).toEqual([]);
+    } finally {
+      await host.close();
+    }
+  },
+);
+
+test("late queued-summary cancellation cannot fail a question retried immediately on Stop", async () => {
+  const host = await setup();
+  try {
+    await host.session.prompt("parent A");
+    await host.session.prompt("/btw existing conversation");
+    await finished(host.events, 0);
+    host.provider.hold = true;
+    await host.session.prompt("/btw active question ahead of summary");
+    await until(() => host.provider.requests[2], "held active request");
+    await host.session.prompt("/btw:summarize queued summary");
+    let retried = false;
+    const unsubscribe = host.pi.events.on("pi-btw:thread", (raw) => {
+      const event = raw as BtwThreadEvent;
+      if (
+        event.type === "state" &&
+        event.thread.status === "aborted" &&
+        !retried
+      ) {
+        retried = true;
+        host.provider.hold = false;
+        void host.session.prompt("/btw immediate retry after Stop");
+      }
+    });
+    const offset = host.events.length;
+    await host.session.prompt("/btw:abort");
+    await finished(host.events, offset);
+    await until(
+      () => host.notices.find((notice) => notice.includes("canceled")),
+      "late cancellation settled",
+    );
+    expect(retried).toBe(true);
+    expect(host.provider.requests).toHaveLength(4);
+    expect(
+      states(host.events.slice(offset)).some(
+        (state) => state.status === "failed",
+      ),
+    ).toBe(false);
+    expect(states(host.events).at(-1)?.status).toBe("idle");
+    expect(host.errors).toEqual([]);
+    unsubscribe();
+  } finally {
+    await host.close();
+  }
+});

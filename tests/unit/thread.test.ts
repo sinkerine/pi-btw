@@ -293,3 +293,64 @@ test.each(["aborted", "error"] as const)(
     expect(messages[3]).toEqual(result);
   },
 );
+
+test("summary result belongs to its own queued request even if a later question has already started", async () => {
+  const host = setup();
+  try {
+    await host.thread.ask("existing side conversation");
+    host.provider.hold = true;
+    const summary = host.thread.summarize("concise");
+    const request = await until(
+      () => host.provider.requests[1],
+      "own summary request",
+    );
+    const later = host.thread.ask("later unrelated question");
+    request.finish(assistant("own summary answer"));
+    expect(await summary).toBe("own summary answer");
+    const next = await until(() => host.provider.requests[2], "later request");
+    next.finish(assistant("later unrelated answer"));
+    await later;
+  } finally {
+    await host.thread.dispose();
+  }
+});
+
+test.each(["running", "queued", "empty answer", "provider error"])(
+  "%s summary never returns an old, aborted, empty or failed answer",
+  async (scenario) => {
+    const host = setup();
+    try {
+      await expect(host.thread.summarize()).rejects.toThrow("BTW is empty");
+      expect(host.provider.requests).toHaveLength(0);
+      await host.thread.ask("old answer must never be forwarded");
+      if (scenario === "running" || scenario === "queued") {
+        host.provider.hold = true;
+        let active: Promise<void> | undefined;
+        if (scenario === "queued") {
+          active = host.thread.ask("request ahead of summary");
+          await until(
+            () => host.provider.requests[1],
+            "request before queued summary",
+          );
+        }
+        const summary = host.thread.summarize();
+        const rejected = expect(summary).rejects.toThrow("canceled");
+        if (scenario === "running")
+          await until(() => host.provider.requests[1], "running summary");
+        host.thread.abort();
+        await active;
+        await rejected;
+        expect(host.thread.state().status).toBe("aborted");
+        expect(host.provider.requests).toHaveLength(2);
+      } else {
+        host.provider.response = () =>
+          assistant("", scenario === "provider error" ? "error" : "stop");
+        await expect(host.thread.summarize()).rejects.toThrow("provider_error");
+        if (scenario === "provider error")
+          expect(host.thread.state().status).toBe("failed");
+      }
+    } finally {
+      await host.thread.dispose();
+    }
+  },
+);

@@ -8,7 +8,11 @@ import {
 import type { BtwBoundary } from "./contract.js";
 import { digest } from "./digest.js";
 import { BtwError } from "./errors.js";
-import { type BtwRequestSettings, requestSettings } from "./request.js";
+import {
+  type BtwRequestSettings,
+  captureRequestSettings,
+  requireIndependentTransport,
+} from "./request.js";
 export interface BtwSnapshot {
   messages: AgentMessage[];
   boundary: BtwBoundary;
@@ -32,15 +36,25 @@ export class BoundaryTracker {
       this.coherent = null;
       this.completed = 0;
     });
-    pi.on("session_tree", () => {
+    pi.on("session_tree", (_event, ctx) => {
       this.pending = null;
+      if (
+        !ctx.sessionManager
+          .getBranch()
+          .some(
+            (entry) => entry.id === this.coherent?.boundary.parentLeafEntryId,
+          )
+      ) {
+        this.coherent = null;
+        this.completed = 0;
+      }
     });
     pi.on("context_with_system", (event, ctx) => {
       if (!ctx.model) return;
       this.pending = structuredClone({
         messages: convertToLlm(event.messages),
         model: ctx.model,
-        request: requestSettings(pi),
+        request: captureRequestSettings(pi),
         parentSessionId: ctx.sessionManager.getSessionId(),
       });
       return { messages: event.messages };
@@ -91,6 +105,7 @@ export class BoundaryTracker {
       .getBranch()
       .some((entry) => entry.id === snapshot.boundary.parentLeafEntryId);
     if (!belongs) throw new BtwError("no_finished_turn");
+    requireIndependentTransport(snapshot.request);
     return structuredClone(snapshot);
   }
   completedTurnsSince(boundary: BtwBoundary): number {

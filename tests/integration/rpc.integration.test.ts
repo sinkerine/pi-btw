@@ -251,9 +251,9 @@ test("unpinned empty RPC composer claims no snapshot or resume until a real fini
   }
 });
 
-test("inject while busy and summarize each send one follow-up; close and clear send nothing", async () => {
+test("inject while busy and summarize while busy each send one follow-up; close and clear send nothing", async () => {
   const stub = await httpStub("openai-completions", (capture, index) => ({
-    hold: index === 2,
+    hold: index === 2 || index === 4,
     text: JSON.stringify(capture.body).includes("Summarize this BTW")
       ? "SUMMARY FOR MAIN"
       : "fixture answer",
@@ -279,15 +279,55 @@ test("inject while busy and summarize each send one follow-up; close and clear s
     );
     expect(stub.captures).toHaveLength(4);
     expect(JSON.stringify(stub.captures[3]?.body)).toContain("focus on X");
+    const beforeSummaryParent = pi.records.length;
+    await pi.prompt("parent busy for summary");
+    await until(() => stub.captures[4], "held summary parent");
+    const beforeSummary = pi.events.length;
     await pi.prompt("/btw:summarize concise");
-    await until(() => stub.captures[5], "summary delivered to parent");
-    expect(JSON.stringify(stub.captures[5]?.body)).toContain(
-      "SUMMARY FOR MAIN",
-    );
+    await pi.state("idle", beforeSummary);
+    expect(stub.captures).toHaveLength(6);
+    expect((await pi.rpc("get_state")).data?.isStreaming).toBe(true);
+    expect(
+      pi.records
+        .slice(beforeSummaryParent)
+        .some((record) => record.type === "agent_settled"),
+    ).toBe(false);
+    stub.release(4);
     await until(
-      () => pi.records.findLast((record) => record.type === "agent_settled"),
-      "summary parent settled",
+      () =>
+        pi.records
+          .slice(beforeSummaryParent)
+          .find((record) => record.type === "agent_settled"),
+      "uninterrupted summary parent and its follow-up settled",
     );
+    expect(stub.captures).toHaveLength(7);
+    const delivered = stub.captures[6]?.body.messages.filter(
+      (message) =>
+        message.role === "user" &&
+        JSON.stringify(message.content).includes("SUMMARY FOR MAIN"),
+    );
+    expect(delivered).toHaveLength(1);
+    expect(JSON.stringify(stub.captures[6]?.body)).toContain(
+      "parent busy for summary",
+    );
+    expect((await pi.rpc("get_state")).data?.isStreaming).toBe(false);
+    const beforeIdleSummary = pi.records.length;
+    await pi.prompt("/btw:summarize concise while idle");
+    await until(
+      () =>
+        pi.records
+          .slice(beforeIdleSummary)
+          .find((record) => record.type === "agent_settled"),
+      "idle summary delivered and parent settled",
+    );
+    expect(stub.captures).toHaveLength(9);
+    expect(stub.captures[8]?.body.messages.at(-1)).toMatchObject({
+      role: "user",
+      content: [
+        { type: "text", text: "SUMMARY FOR MAIN" },
+        { type: "text", text: " [context-transform]" },
+      ],
+    });
     const calls = stub.captures.length;
     await pi.prompt("/btw:clear");
     expect(stub.captures).toHaveLength(calls);
@@ -366,6 +406,17 @@ test("resume restores exact snapshot and structured tool suffix; missing/corrupt
           record.message.includes("snapshot_unavailable"),
       ),
     ).toBe(true);
+    await pi.parent("new coherent parent after corrupt snapshot");
+    const recoveryOffset = pi.events.length;
+    await pi.prompt("/btw recover with newly captured context");
+    const recovered = await pi.state("idle", recoveryOffset);
+    expect(recovered.threadId).not.toBe(first.threadId);
+    expect(JSON.stringify(stub.captures.at(-1)?.body)).toContain(
+      "new coherent parent after corrupt snapshot",
+    );
+    expect(JSON.stringify(stub.captures.at(-1)?.body)).not.toContain(
+      "remember tools",
+    );
   } finally {
     await pi.close();
     await stub.close();
@@ -860,3 +911,237 @@ for (const api of ["openai-completions", "anthropic-messages"] as const) {
     }
   });
 }
+
+test.each([false, true])(
+  "real Pi rewind after rebase=%s never continues or injects abandoned context and survives restart",
+  async (rebased) => {
+    const stub = await httpStub("openai-completions", () => ({}));
+    const pi = await PiFixture.create(stub.baseUrl, "openai-completions");
+    try {
+      await pi.start();
+      await pi.parent("rewind parent A");
+      await pi.prompt("/btw side on A");
+      const initial = await pi.state();
+      const parentFile = (await pi.rpc("get_state")).data?.sessionFile;
+      if (typeof parentFile !== "string")
+        throw new Error("parent file missing");
+      await pi.parent("abandoned parent B");
+      if (rebased) {
+        const before = pi.events.length;
+        await pi.prompt("/btw abandoned side on B");
+        await pi.state("idle", before);
+      }
+      const entries = (await readFile(parentFile, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      const userB = entries.find(
+        (entry) =>
+          entry.type === "message" &&
+          entry.message.role === "user" &&
+          JSON.stringify(entry.message.content).includes("abandoned parent B"),
+      );
+      if (!userB) throw new Error("rewind user entry missing");
+      const beforeRewind = pi.events.length;
+      await pi.prompt(`/fixture:branch ${userB.id}`);
+      expect((await pi.rpc("get_state")).data?.isStreaming).toBe(false);
+      if (rebased) {
+        expect(pi.events.slice(beforeRewind)).toContainEqual(
+          expect.objectContaining({
+            type: "closed",
+            threadId: initial.threadId,
+          }),
+        );
+        const calls = stub.captures.length;
+        await pi.prompt("/btw:inject must not leak");
+        expect(stub.captures).toHaveLength(calls);
+        expect(
+          pi.records.some(
+            (record) =>
+              typeof record.message === "string" &&
+              record.message.includes("BTW closed after parent rewind"),
+          ),
+        ).toBe(true);
+      }
+      if (!rebased) {
+        const beforeFollowUp = pi.events.length;
+        await pi.prompt("/btw follow-up immediately after rewind");
+        const followUp = await pi.state("idle", beforeFollowUp);
+        expect(followUp.threadId).toBe(initial.threadId);
+        expect(followUp.boundary).toEqual(initial.boundary);
+        expect(JSON.stringify(stub.captures.at(-1)?.body)).not.toContain(
+          "abandoned parent B",
+        );
+      }
+      await pi.stop();
+      await pi.start(parentFile);
+      const offset = pi.events.length;
+      await pi.prompt("/btw coherent question after rewind restart");
+      const resumed = await pi.state("idle", offset);
+      expect(resumed.boundary.prefixDigest).toBe(initial.boundary.prefixDigest);
+      if (rebased) expect(resumed.threadId).not.toBe(initial.threadId);
+      else expect(resumed.threadId).toBe(initial.threadId);
+      const body = JSON.stringify(stub.captures.at(-1)?.body);
+      expect(body).toContain("rewind parent A");
+      expect(body).not.toContain("abandoned parent B");
+      expect(body).not.toContain("abandoned side on B");
+      if (!rebased) expect(body).toContain("side on A");
+      else expect(body).not.toContain("side on A");
+      expect(body).toContain("coherent question after rewind restart");
+      expect(
+        pi.records.filter((record) => record.type === "extension_error"),
+      ).toEqual([]);
+    } finally {
+      await pi.close();
+      await stub.close();
+    }
+  },
+);
+
+test("alternate branch overwriting latest checkpoint restores only the exact on-branch thread snapshot on switch and restart", async () => {
+  const stub = await httpStub("openai-completions", () => ({}));
+  const pi = await PiFixture.create(stub.baseUrl, "openai-completions");
+  try {
+    await pi.start();
+    await pi.parent("original branch A parent");
+    await pi.prompt("/btw branch A suffix");
+    const branchA = await pi.state();
+    const parentFile = (await pi.rpc("get_state")).data?.sessionFile;
+    if (typeof parentFile !== "string" || !branchA.sessionFile)
+      throw new Error("persistent files missing");
+    const entries = (await readFile(parentFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const userA = entries.find(
+      (entry) => entry.type === "message" && entry.message.role === "user",
+    );
+    const indexA = entries.findLast(
+      (entry) => entry.customType === "pi-btw/thread",
+    );
+    await pi.prompt(`/fixture:branch ${userA.id}`);
+    await pi.parent("alternate branch B parent");
+    const beforeB = pi.events.length;
+    await pi.prompt("/btw branch B suffix");
+    const branchB = await pi.state("idle", beforeB);
+    expect(branchB.threadId).not.toBe(branchA.threadId);
+    const checkpoint = join(branchA.sessionFile, "..", "..", "latest.json");
+    expect(await readFile(checkpoint, "utf8")).toContain(
+      "alternate branch B parent",
+    );
+    const beforeSwitch = pi.events.length;
+    await pi.prompt(`/fixture:branch ${indexA.id}`);
+    const switched = await pi.state("idle", beforeSwitch);
+    expect(switched.threadId).toBe(branchA.threadId);
+    await pi.stop();
+    await pi.start(parentFile);
+    const restored = await pi.state();
+    expect(restored.threadId).toBe(branchA.threadId);
+    const beforeQuestion = pi.events.length;
+    await pi.prompt("/btw branch A next question");
+    await pi.state("idle", beforeQuestion);
+    const captured = stub.captures.at(-1)?.body;
+    const snapshot = JSON.parse(
+      await readFile(
+        join(
+          branchA.sessionFile,
+          "..",
+          `${branchA.boundary.prefixDigest}.json`,
+        ),
+        "utf8",
+      ),
+    );
+    expect(snapshot.boundary).toEqual(branchA.boundary);
+    expect(JSON.stringify(captured)).toContain("original branch A parent");
+    expect(JSON.stringify(captured)).toContain("branch A suffix");
+    expect(JSON.stringify(captured)).not.toContain("alternate branch B parent");
+    expect(JSON.stringify(captured)).not.toContain("branch B suffix");
+    expect(
+      captured?.messages.slice(0, stub.captures[1]?.body.messages.length),
+    ).toEqual(stub.captures[1]?.body.messages);
+    expect(
+      pi.records.filter((record) => record.type === "extension_error"),
+    ).toEqual([]);
+  } finally {
+    await pi.close();
+    await stub.close();
+  }
+});
+
+test.each(["before response", "partial response", "queued"])(
+  "abort summary %s while parent busy delivers nothing to main",
+  async (scenario) => {
+    const stub = await httpStub("openai-completions", (_capture, index) => {
+      if (index === 2) return { hold: true };
+      if (index === 3)
+        return scenario === "partial response"
+          ? {
+              text: "PARTIAL SUMMARY MUST NOT REACH MAIN",
+              pauseAfterContent: true,
+            }
+          : { hold: true };
+      return {
+        text:
+          index === 1 ? "OLD SIDE ANSWER MUST NOT REACH MAIN" : "parent answer",
+      };
+    });
+    const pi = await PiFixture.create(stub.baseUrl, "openai-completions");
+    try {
+      await pi.start();
+      await pi.parent("parent A");
+      await pi.prompt("/btw existing conversation");
+      await pi.state();
+      const beforeParent = pi.records.length;
+      await pi.prompt("parent busy during canceled summary");
+      await until(() => stub.captures[2], "held parent during cancellation");
+      if (scenario === "queued") {
+        await pi.prompt("/btw ahead of queued summary");
+        await until(() => stub.captures[3], "held side request before summary");
+      }
+      const beforeSummary = pi.events.length;
+      await pi.prompt("/btw:summarize canceled summary");
+      if (scenario !== "queued")
+        await until(() => stub.captures[3], "summary request");
+      if (scenario === "partial response") {
+        const running = await pi.state("running", beforeSummary);
+        if (!running.sessionFile) throw new Error("child file missing");
+        const partialFile = join(running.sessionFile, "..", "partial.json");
+        await until(
+          () =>
+            existsSync(partialFile) &&
+            readFileSync(partialFile, "utf8").includes("PARTIAL SUMMARY")
+              ? true
+              : undefined,
+          "streamed summary partial",
+        );
+      }
+      await pi.prompt("/btw:abort");
+      await pi.state("aborted", beforeSummary);
+      expect((await pi.rpc("get_state")).data?.isStreaming).toBe(true);
+      stub.release(2);
+      await until(
+        () =>
+          pi.records
+            .slice(beforeParent)
+            .find((record) => record.type === "agent_settled"),
+        "uninterrupted parent settles without summary follow-up",
+      );
+      expect(stub.captures).toHaveLength(4);
+      const messages = await pi.rpc("get_messages");
+      expect(JSON.stringify(messages.data)).not.toContain(
+        "PARTIAL SUMMARY MUST NOT REACH MAIN",
+      );
+      expect(JSON.stringify(messages.data)).not.toContain(
+        "OLD SIDE ANSWER MUST NOT REACH MAIN",
+      );
+      const final = pi.events.filter((event) => event.type === "state").at(-1);
+      expect(final).toMatchObject({
+        type: "state",
+        thread: { status: "aborted" },
+      });
+    } finally {
+      await pi.close();
+      await stub.close();
+    }
+  },
+);

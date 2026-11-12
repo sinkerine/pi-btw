@@ -51,6 +51,7 @@ export class BtwCommands {
   constructor(private pi: ExtensionAPI) {
     this.tracker = new BoundaryTracker(pi, async (snapshot, ctx) => {
       saveCheckpoint(snapshot, ctx);
+      this.restoreError = null;
       this.thread?.parentAdvanced();
     });
     pi.on("session_start", async (_event, ctx) => {
@@ -58,12 +59,7 @@ export class BtwCommands {
     });
     pi.on("session_tree", async (_event, ctx) => {
       try {
-        const index = latestThreadIndex(
-          ctx.sessionManager.getBranch(),
-          ctx.sessionManager.getSessionId(),
-        );
-        if (this.thread && index?.threadId === this.thread.id) return;
-        await this.restore(ctx);
+        await this.restore(ctx, true);
       } catch (error) {
         await this.close("replaced");
         this.restoreError =
@@ -89,8 +85,7 @@ export class BtwCommands {
         },
       });
   }
-  private async restore(ctx: ExtensionContext): Promise<void> {
-    await this.close("replaced");
+  private async restore(ctx: ExtensionContext, tree = false): Promise<void> {
     this.restoreError = null;
     try {
       const checkpoint = loadCheckpoint(ctx);
@@ -99,10 +94,52 @@ export class BtwCommands {
         ctx.sessionManager.getBranch(),
         ctx.sessionManager.getSessionId(),
       );
+      const activeBoundary = this.thread?.state().boundary;
+      const sameThread =
+        this.thread &&
+        index?.threadId === this.thread.id &&
+        index.boundary.prefixDigest === activeBoundary?.prefixDigest;
+      const draft =
+        this.thread &&
+        !index &&
+        activeBoundary?.kind === "none" &&
+        this.thread.state().parentSessionId ===
+          ctx.sessionManager.getSessionId();
+      if (sameThread || draft) {
+        if (!checkpoint && index?.mode === "contextual" && this.store) {
+          const snapshot = await this.store.loadSnapshot(
+            index.boundary.prefixDigest,
+          );
+          this.restoreBoundary(snapshot, ctx);
+        }
+        // Pi tree navigation changes only the in-memory leaf until an entry is appended.
+        if (tree && index) this.pi.appendEntry("pi-btw/thread", index);
+        return;
+      }
+      await this.close("replaced");
       if (!index) return;
       const store = BtwStore.resume(ctx, index);
       const snapshot = await store.loadSnapshot(index.boundary.prefixDigest);
       const saved = store.readState();
+      if (!checkpoint && index.mode === "contextual")
+        this.restoreBoundary(snapshot, ctx);
+      if (
+        saved &&
+        saved.boundary.prefixDigest !== index.boundary.prefixDigest
+      ) {
+        // The append-only child suffix moved past this branch's index. Never replay abandoned turns.
+        this.pi.appendEntry("pi-btw/clear", {
+          parentSessionId: ctx.sessionManager.getSessionId(),
+        });
+        this.notice(
+          ctx,
+          new BtwError(
+            "no_thread",
+            "BTW closed after parent rewind before a rebase; use /btw to start a new thread on this branch",
+          ),
+        );
+        return;
+      }
       if (saved?.status === "running") store.recoverInterrupted();
       this.makeThread(
         ctx,
@@ -112,11 +149,24 @@ export class BtwCommands {
         saved?.status === "running",
         saved,
       );
+      if (tree) this.index(snapshot);
       this.emit(this.threadState());
     } catch (error) {
+      await this.close("replaced");
       this.restoreError =
         error instanceof Error ? error : new Error(String(error));
       this.notice(ctx, this.restoreError);
+    }
+  }
+  private restoreBoundary(snapshot: BtwSnapshot, ctx: ExtensionContext): void {
+    if (
+      snapshot.parentSessionId === ctx.sessionManager.getSessionId() &&
+      ctx.sessionManager
+        .getBranch()
+        .some((entry) => entry.id === snapshot.boundary.parentLeafEntryId)
+    ) {
+      this.tracker.restore(snapshot);
+      saveCheckpoint(snapshot, ctx);
     }
   }
   private notice(ctx: ExtensionContext, error: unknown): void {
@@ -360,6 +410,11 @@ export class BtwCommands {
     if (name === "btw:inject" || name === "btw:summarize") {
       const thread = this.thread;
       if (!thread) throw new BtwError("no_thread");
+      if (!thread.transcriptText().trim())
+        throw new BtwError(
+          "no_thread",
+          "BTW is empty; ask a question before sending to main",
+        );
       if (this.deliveryPending)
         throw new BtwError("busy", "BTW delivery already pending");
       this.deliveryPending = true;
@@ -376,7 +431,12 @@ export class BtwCommands {
       this.background(
         task()
           .catch((error: unknown) => {
-            if (generation === this.generation) thread.fail(error);
+            if (
+              generation === this.generation &&
+              thread.state().status !== "aborted" &&
+              !(error instanceof BtwError && error.code === "busy")
+            )
+              thread.fail(error);
             throw error;
           })
           .finally(() => {

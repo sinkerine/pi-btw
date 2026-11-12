@@ -26,6 +26,19 @@ export interface BtwRequestSettings {
 export function requestSettings(
   pi: Pick<ExtensionAPI, "getSettings" | "getThinkingLevel">,
 ): BtwRequestSettings {
+  const request = captureRequestSettings(pi);
+  requireIndependentTransport(request);
+  return request;
+}
+export function requireIndependentTransport(request: BtwRequestSettings): void {
+  const transport = request.options.transport;
+  // An explicit WebSocket session can carry mutable response state. Do not share it.
+  if (transport === "websocket" || transport === "websocket-cached")
+    throw new BtwError("unsupported_serialization", transport);
+}
+export function captureRequestSettings(
+  pi: Pick<ExtensionAPI, "getSettings" | "getThinkingLevel">,
+): BtwRequestSettings {
   const manager = SettingsManager.inMemory(pi.getSettings());
   const settings = manager.getSettings();
   const retry = manager.getProviderRetrySettings();
@@ -36,9 +49,6 @@ export function requestSettings(
       ? settings.enableInstallTelemetry !== false
       : /^(1|true|yes)$/i.test(telemetryEnv);
   const transport = settings.transport ?? "auto";
-  // An explicit WebSocket session can carry mutable response state. Do not share it.
-  if (transport === "websocket" || transport === "websocket-cached")
-    throw new BtwError("unsupported_serialization", transport);
   const retention = process.env.PI_CACHE_RETENTION;
   const cacheRetention =
     retention === "long" || retention === "none" ? retention : "short";

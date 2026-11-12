@@ -3,7 +3,7 @@ import {
   type AgentMessage,
   type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 import {
   convertToLlm,
   type ExtensionContext,
@@ -206,17 +206,26 @@ export class BtwThread {
     };
     this.emit();
   }
-  ask(question: string): Promise<void> {
+  async ask(question: string): Promise<void> {
+    await this.enqueue(question);
+  }
+  private enqueue(question: string): Promise<AssistantMessage | null> {
     const generation = this.generation;
     const task = this.tail.then(() => {
       if (this.disposed || generation !== this.generation)
         throw new BtwError("busy", "Queued BTW request canceled");
-      return this.dispatch(question);
+      return this.dispatch(question, generation);
     });
-    this.tail = task.catch(() => {});
+    this.tail = task.then(
+      () => {},
+      () => {},
+    );
     return task;
   }
-  private async dispatch(question: string): Promise<void> {
+  private async dispatch(
+    question: string,
+    generation: number,
+  ): Promise<AssistantMessage | null> {
     try {
       const latest =
         this.options.mode === "contextual"
@@ -243,6 +252,8 @@ export class BtwThread {
       const changed =
         this.snapshot.boundary.prefixDigest !== latest.boundary.prefixDigest;
       await this.options.store.saveSnapshot(latest);
+      if (this.disposed || generation !== this.generation)
+        throw new BtwError("busy", "BTW request canceled before dispatch");
       if (changed)
         this.options.store.appendBoundary(
           latest.boundary,
@@ -293,6 +304,7 @@ export class BtwThread {
           }),
       });
       this.agent = agent;
+      let answer: AssistantMessage | null = null;
       agent.subscribe((event) => {
         if (event.type === "message_end") {
           if (event.message.role === "assistant") this.cancelPartialTimer();
@@ -312,6 +324,7 @@ export class BtwThread {
           event.message.role === "assistant"
         ) {
           const message = event.message;
+          answer = message;
           this.current.lastUsage = {
             input: message.usage.input,
             output: message.usage.output,
@@ -333,6 +346,9 @@ export class BtwThread {
       this.emit();
       if (this.state().status === "failed")
         throw new BtwError("provider_error", this.current.error ?? undefined);
+      return generation === this.generation && this.current.status === "idle"
+        ? answer
+        : null;
     } catch (error) {
       this.agent = null;
       if (this.current.status !== "aborted") this.current.status = "failed";
@@ -366,12 +382,27 @@ export class BtwThread {
     this.partialTimer.unref();
   }
   async summarize(instructions = ""): Promise<string> {
-    await this.ask(
+    if (!this.transcriptText().trim())
+      throw new BtwError(
+        "no_thread",
+        "BTW is empty; ask a question before summarizing",
+      );
+    const generation = this.generation;
+    const answer = await this.enqueue(
       `Summarize this BTW conversation for the main agent. ${instructions}`,
     );
-    const messages = this.options.store.readMessages();
-    const answer = messages.findLast((message) => message.role === "assistant");
-    return answer ? text(answer) : "";
+    if (!answer || generation !== this.generation)
+      throw new BtwError(
+        "busy",
+        "BTW summary canceled; nothing was sent to main",
+      );
+    const content = text(answer).trim();
+    if (answer.stopReason !== "stop" || !content)
+      throw new BtwError(
+        "provider_error",
+        "BTW summary did not finish with non-empty text; retry summarizing",
+      );
+    return content;
   }
   fail(error: unknown): void {
     this.current.status = "failed";
@@ -401,7 +432,9 @@ export class BtwThread {
   }
   abort(): void {
     this.generation++;
+    this.current.status = "aborted";
     this.agent?.abort();
+    if (!this.disposed) this.emit();
   }
   async dispose(): Promise<void> {
     if (this.disposed) return;
