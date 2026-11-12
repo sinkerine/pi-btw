@@ -466,8 +466,12 @@ test("provider failure is retryable; empty commands make no provider request; ta
 });
 
 test("real TUI opens BTW while main streams and records latest-finished pinning without interrupting main", async () => {
+  const answerToken = "BTW_STREAM_WHILE_PARENT_WORKING";
+  const partialToken = "SIDE_PARTIAL_RETAINED_AFTER_ESC";
   const stub = await httpStub("openai-completions", (_capture, index) => ({
     hold: index === 1 || index === 2,
+    text: index === 2 ? answerToken : index === 3 ? partialToken : undefined,
+    pauseAfterContent: index === 3,
   }));
   const pi = await PiFixture.create(stub.baseUrl, "openai-completions");
   const reportDirectory = process.env.BTW_REPORT_DIR ?? pi.directory;
@@ -481,10 +485,15 @@ test("real TUI opens BTW while main streams and records latest-finished pinning 
     `import {appendFileSync} from "node:fs";
     export default function(pi) {
       function save(event){appendFileSync(${JSON.stringify(eventsFile)}, JSON.stringify(event)+"\\n");}
-      pi.on("session_start", (_e,ctx)=>{save({type:"ready",mode:ctx.mode});ctx.ui.notify("TUI_FIXTURE_READY", "info");});
-      pi.on("turn_end", e=>save({type:"parent_end",index:e.turnIndex}));
+      let context;
+      pi.on("session_start", (_e,ctx)=>{context=ctx;save({type:"ready",mode:ctx.mode});ctx.ui.notify("TUI_FIXTURE_READY", "info");});
+      pi.on("turn_end", e=>save({type:"parent_end",index:e.turnIndex,message:e.message}));
+      pi.on("agent_end", ()=>save({type:"parent_settled"}));
       pi.on("ui_prompt_end", e=>save({type:"overlay_closed",kind:e.kind}));
-      pi.events.on("pi-btw:thread", save);
+      pi.events.on("pi-btw:thread", event=>{
+        save(event);
+        if(event.type === "state") save({type:"parent_activity",revision:event.thread.revision,status:event.thread.status,isIdle:context.isIdle()});
+      });
     }`,
   );
   const env: NodeJS.ProcessEnv = { ...process.env, TERM: "xterm-256color" };
@@ -521,9 +530,19 @@ test("real TUI opens BTW while main streams and records latest-finished pinning 
     { cwd: join(pi.directory, "work"), env, stdio: "pipe" },
   );
   let output = "";
+  let pendingOutput = "";
   let stderr = "";
   child.stdout.on("data", (chunk: Buffer) => {
-    output += chunk.toString();
+    pendingOutput += chunk.toString();
+    let newline = pendingOutput.indexOf("\n");
+    while (newline !== -1) {
+      const record = JSON.parse(pendingOutput.slice(0, newline)) as {
+        output: string;
+      };
+      output += record.output;
+      pendingOutput = pendingOutput.slice(newline + 1);
+      newline = pendingOutput.indexOf("\n");
+    }
   });
   child.stderr.on("data", (chunk: Buffer) => {
     stderr += chunk.toString();
@@ -598,17 +617,20 @@ test("real TUI opens BTW while main streams and records latest-finished pinning 
       "parent B held",
     );
     const beforeMainCompletion = (await events()).length;
-    stub.release(1);
-    await waitEvent(
-      (event) => event.type === "parent_end",
-      "TUI main completes",
-      beforeMainCompletion,
-    );
     await until(
       () => (output.includes("pinned turn 1") ? true : undefined),
       "TUI overlay displays its pin",
     );
+    const beforeAnswer = output.length;
     stub.release(2);
+    await until(
+      () =>
+        output.slice(beforeAnswer).includes(answerToken) &&
+        output.slice(beforeAnswer).includes("Working")
+          ? true
+          : undefined,
+      "TUI renders BTW answer and main Working while parent B remains held",
+    );
     await waitEvent(
       (event) =>
         event.type === "state" &&
@@ -619,7 +641,24 @@ test("real TUI opens BTW while main streams and records latest-finished pinning 
         "revision" in event.thread &&
         Number(event.thread.revision) > 0,
       "TUI side completes",
+      beforeMainCompletion,
     );
+    await waitEvent(
+      (event) =>
+        event.type === "parent_activity" &&
+        event.status === "idle" &&
+        event.isIdle === false,
+      "TUI parent still running after BTW answer completes",
+      beforeMainCompletion,
+    );
+    expect(
+      (await events())
+        .slice(beforeMainCompletion)
+        .filter(
+          (event) =>
+            event.type === "parent_end" || event.type === "parent_settled",
+        ),
+    ).toEqual([]);
     const beforeSideDismiss = (await events()).length;
     input("\u001b");
     await waitEvent(
@@ -627,8 +666,122 @@ test("real TUI opens BTW while main streams and records latest-finished pinning 
       "TUI overlay dismisses and restores main focus",
       beforeSideDismiss,
     );
+    const beforeAlias = (await events()).length;
+    const beforePartial = output.length;
+    input("/side abort this partial side answer\r");
+    await until(() => stub.captures[3], "TUI /side request while main held");
+    const alias = await waitEvent(
+      (event) =>
+        event.type === "state" &&
+        (event.thread as { status: string }).status === "running",
+      "TUI /side opens running BTW",
+      beforeAlias,
+    );
+    expect(alias.thread).toMatchObject({
+      threadId: running?.thread.threadId,
+      boundary: { parentTurnIndex: 1 },
+    });
+    expect(JSON.stringify(stub.captures[3]?.body)).not.toContain(
+      "parent B held",
+    );
+    expect(JSON.stringify(stub.captures[3]?.body)).toContain(
+      "why from parent context?",
+    );
+    await until(
+      () =>
+        output.slice(beforePartial).includes(partialToken) &&
+        output.slice(beforePartial).includes("Working")
+          ? true
+          : undefined,
+      "TUI displays live /side partial with main Working",
+    );
+    const beforeEscape = (await events()).length;
+    const beforeAbortedRender = output.length;
+    input("\u001b");
+    const aborted = await waitEvent(
+      (event) =>
+        event.type === "state" &&
+        (event.thread as { status: string }).status === "aborted",
+      "first real Esc stops only BTW",
+      beforeEscape,
+    );
+    expect(aborted.thread).toMatchObject({
+      threadId: running?.thread.threadId,
+      boundary: { parentTurnIndex: 1 },
+    });
+    await waitEvent(
+      (event) =>
+        event.type === "parent_activity" &&
+        event.status === "aborted" &&
+        event.isIdle === false,
+      "parent remains running after Esc aborts BTW",
+      beforeEscape,
+    );
+    await until(
+      () =>
+        output
+          .slice(beforeAbortedRender)
+          .includes("BTW · aborted · pinned turn 1") &&
+        // Pi redraws changed rows; the already visible partial row stays on screen.
+        output.slice(beforePartial).includes(partialToken)
+          ? true
+          : undefined,
+      "aborted overlay retains visible partial before dismissal",
+    );
+    expect(
+      (await events())
+        .slice(beforeEscape)
+        .filter((event) => event.type === "overlay_closed"),
+    ).toEqual([]);
+    const childFile = (aborted.thread as { sessionFile: string }).sessionFile;
+    const childMessages = (await readFile(childFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.type === "message")
+      .map((entry) => entry.message);
+    expect(childMessages).toContainEqual(
+      expect.objectContaining({
+        role: "assistant",
+        stopReason: "aborted",
+        content: expect.arrayContaining([
+          expect.objectContaining({ type: "text", text: partialToken }),
+        ]),
+      }),
+    );
+    expect(
+      (await events())
+        .slice(beforeMainCompletion)
+        .filter(
+          (event) =>
+            event.type === "parent_end" || event.type === "parent_settled",
+        ),
+    ).toEqual([]);
+    expect(stub.captures).toHaveLength(4);
+    const beforeAbortDismiss = (await events()).length;
+    input("\u001b");
+    await waitEvent(
+      (event) => event.type === "overlay_closed",
+      "separate second Esc dismisses aborted overlay",
+      beforeAbortDismiss,
+    );
+    stub.release(1);
+    const mainCompleted = await waitEvent(
+      (event) => event.type === "parent_end",
+      "TUI main completes normally after both busy commands and Esc",
+      beforeMainCompletion,
+    );
+    expect(mainCompleted.message).toMatchObject({
+      role: "assistant",
+      stopReason: "stop",
+    });
+    await waitEvent(
+      (event) => event.type === "parent_settled",
+      "TUI main settles before follow-up",
+      beforeMainCompletion,
+    );
     input("/btw next finished parent turn\r");
-    await until(() => stub.captures[3], "TUI follow-up request");
+    await until(() => stub.captures[4], "TUI follow-up request");
     const latest = await waitEvent(
       (event) =>
         event.type === "state" &&
@@ -642,11 +795,45 @@ test("real TUI opens BTW while main streams and records latest-finished pinning 
       "TUI repins to completed B",
     );
     expect(latest.type).toBe("state");
-    expect(JSON.stringify(stub.captures[3]?.body)).toContain("parent B held");
-    expect(stderr).toBe("");
-    expect((await readFile(recording, "utf8")).split("\n")[0]).toContain(
-      '"version": 2',
+    expect(JSON.stringify(stub.captures[4]?.body)).toContain("parent B held");
+    await waitEvent(
+      (event) =>
+        event.type === "state" &&
+        (
+          event.thread as {
+            status: string;
+            boundary: { parentTurnIndex: number };
+          }
+        ).status === "idle" &&
+        (event.thread as { boundary: { parentTurnIndex: number } }).boundary
+          .parentTurnIndex === 2,
+      "TUI follow-up completes at turn 2",
     );
+    if (process.env.BTW_REPORT_DIR)
+      await writeFile(
+        join(reportDirectory, "tui-proof.json"),
+        JSON.stringify(
+          {
+            answerToken,
+            partialToken,
+            abortedMessages: childMessages,
+            captures: stub.captures,
+          },
+          null,
+          2,
+        ),
+      );
+    expect(stderr).toBe("");
+    const castLines = (await readFile(recording, "utf8")).trim().split("\n");
+    expect(castLines[0]).toContain('"version": 2');
+    const recordedInputs = castLines
+      .slice(1)
+      .map((line) => JSON.parse(line) as [number, string, string])
+      .filter((record) => record[1] === "i")
+      .map((record) => record[2]);
+    expect(recordedInputs).toContain("/btw why from parent context?\r");
+    expect(recordedInputs).toContain("/side abort this partial side answer\r");
+    expect(recordedInputs.filter((text) => text === "\u001b")).toHaveLength(4);
     if (process.env.BTW_REPORT_DIR)
       await writeFile(
         join(reportDirectory, "tui-events.json"),

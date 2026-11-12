@@ -49,6 +49,8 @@ try:
                     if request.get("stop"):
                         child.terminate()
                         break
+                    recording.write(json.dumps([round(time.monotonic() - started, 6), "i", request["text"]], ensure_ascii=False) + "\n")
+                    recording.flush()
                     for char in request["text"]:
                         os.write(master, char.encode("utf8"))
                         time.sleep(0.005)
